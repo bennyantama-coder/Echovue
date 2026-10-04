@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#0f766e" />
+  <meta name="description" content="Viewer lokal untuk arsip GE MPEGVue di Mac/Windows. Data pasien diproses di perangkat dan tidak diunggah." />
+  <title>EchoVue PWA</title>
+  <link rel="manifest" href="./manifest.webmanifest" />
+  <link rel="icon" href="./icons/icon-192.png" />
+  <link rel="apple-touch-icon" href="./icons/icon-192.png" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <div class="brand-row">
+        <span class="brand-mark">◒</span>
+        <h1>EchoVue</h1>
+        <span class="badge">PWA • lokal</span>
+      </div>
+      <p>Viewer arsip echo MPEGVue — file pasien tetap di perangkat Anda.</p>
+    </div>
+    <div class="top-actions">
+      <button id="installBtn" class="secondary" hidden>Install App</button>
+      <button id="openFolderBtn" class="primary">Buka Folder Echo</button>
+      <input id="folderInput" type="file" webkitdirectory multiple hidden />
+    </div>
+  </header>
+
+  <main>
+    <section id="privacyBanner" class="privacy-banner">
+      <strong>Privasi:</strong> folder echo dibaca langsung oleh browser. Aplikasi ini tidak memiliki fitur upload ke server.
+      Untuk memutar WMV, konversi dilakukan lokal di browser menggunakan FFmpeg WebAssembly.
+    </section>
+
+    <section id="libraryView" class="panel">
+      <div class="panel-head">
+        <div>
+          <h2>Daftar Pemeriksaan</h2>
+          <p id="libraryStatus">Belum ada folder yang dipilih.</p>
+        </div>
+        <div class="search-wrap">
+          <input id="searchInput" type="search" placeholder="Cari ID / nama / tanggal…" disabled />
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Other ID</th>
+              <th>Patient Name</th>
+              <th>Exam Date</th>
+              <th>Birth Date</th>
+              <th class="num">Images</th>
+            </tr>
+          </thead>
+          <tbody id="examTableBody">
+            <tr class="empty-row"><td colspan="6">Pilih folder MPEGVue untuk mulai.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="examView" class="panel exam-view" hidden>
+      <div class="exam-head">
+        <div>
+          <button id="backBtn" class="link-btn">← Daftar pemeriksaan</button>
+          <h2 id="examTitle">Exam View</h2>
+          <p id="examMeta"></p>
+        </div>
+        <div class="exam-actions">
+          <button id="screenshotBtn" class="secondary">Screenshot</button>
+          <button id="fullscreenBtn" class="secondary">Fullscreen</button>
+        </div>
+      </div>
+
+      <div class="viewer-grid">
+        <aside class="thumb-pane">
+          <div id="thumbGrid" class="thumb-grid"></div>
+        </aside>
+
+        <section class="viewer-pane">
+          <div id="viewerStage" class="viewer-stage">
+            <video id="sourceVideo" playsinline muted hidden></video>
+            <canvas id="videoCanvas"></canvas>
+            <div id="viewerPlaceholder" class="viewer-placeholder">
+              <div class="spinner" hidden></div>
+              <p>Pilih cine di sebelah kiri.</p>
+            </div>
+            <div id="transcodeStatus" class="transcode-status" hidden></div>
+          </div>
+
+          <div class="timeline-wrap">
+            <input id="timeline" type="range" min="0" max="1000" value="0" disabled />
+            <div class="time-row">
+              <span id="timeLabel">00:00 / 00:00</span>
+              <select id="speedSelect" disabled>
+                <option value="0.25">0.25×</option>
+                <option value="0.5">0.5×</option>
+                <option value="0.75">0.75×</option>
+                <option value="1" selected>1×</option>
+                <option value="1.25">1.25×</option>
+                <option value="1.5">1.5×</option>
+                <option value="2">2×</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="transport">
+            <button id="prevCineBtn" title="Cine sebelumnya">⟵</button>
+            <button id="stepBackBtn" title="Mundur satu frame">◀◀</button>
+            <button id="playBtn" class="transport-main" title="Play/Pause">▶</button>
+            <button id="stopBtn" title="Stop">■</button>
+            <button id="stepForwardBtn" title="Maju satu frame">▶▶</button>
+            <button id="nextCineBtn" title="Cine berikutnya">⟶</button>
+          </div>
+
+          <div class="enhance-panel">
+            <div class="preset-row">
+              <button class="preset active" data-preset="original">Original</button>
+              <button class="preset" data-preset="gelike">GE-like</button>
+              <button class="preset" data-preset="custom">Custom</button>
+            </div>
+
+            <div class="sliders">
+              <label>Brightness <input id="brightness" type="range" min="-0.25" max="0.25" step="0.01" value="0" /><output id="brightnessOut">0.00</output></label>
+              <label>Contrast <input id="contrast" type="range" min="0.5" max="2" step="0.01" value="1" /><output id="contrastOut">1.00</output></label>
+              <label>Gamma <input id="gamma" type="range" min="0.5" max="2" step="0.01" value="1" /><output id="gammaOut">1.00</output></label>
+              <label>Sharpness <input id="sharpness" type="range" min="0" max="0.8" step="0.01" value="0" /><output id="sharpnessOut">0.00</output></label>
+            </div>
+            <p class="hint">Preset GE-like adalah pendekatan visual, bukan algoritme resmi GE Healthcare.</p>
+          </div>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="errorDialog">
+    <h3>Terjadi masalah</h3>
+    <p id="errorText"></p>
+    <form method="dialog"><button class="primary">Tutup</button></form>
+  </dialog>
+
+  <footer>
+    EchoVue PWA prototype 0.4 • local-processing • tidak untuk menggantikan sistem diagnostik tervalidasi.
+  </footer>
+
+  <script src="./app.js"></script>
+</body>
+</html>
