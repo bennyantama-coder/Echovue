@@ -1,0 +1,396 @@
+name: Build EchoVue Native macOS
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/build-native-macos.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-apple-silicon:
+    runs-on: macos-14
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create native source
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf native-src
+          mkdir -p native-src/Sources/EchoVueMac
+          cat > native-src/Package.swift <<'SWIFTPKG'
+          // swift-tools-version: 5.9
+          import PackageDescription
+          let package = Package(
+              name: "EchoVueMac",
+              platforms: [.macOS(.v13)],
+              products: [.executable(name: "EchoVueMac", targets: ["EchoVueMac"])],
+              targets: [.executableTarget(name: "EchoVueMac", path: "Sources/EchoVueMac")]
+          )
+          SWIFTPKG
+
+          cat > native-src/Sources/EchoVueMac/EchoVue.swift <<'SWIFT'
+          import SwiftUI
+          import AppKit
+          import AVKit
+          import AVFoundation
+          import CryptoKit
+          import UniformTypeIdentifiers
+          import Combine
+
+          struct ExamRecord: Identifiable, Hashable {
+              let id = UUID()
+              let folderURL: URL
+              let patientID: String
+              let firstName: String
+              let lastName: String
+              let examDate: String
+              let birthDate: String
+              let sex: String
+              let numImages: Int
+              let media: [URL]
+              var patientName: String {
+                  let parts = [lastName, firstName].filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                  return parts.joined(separator: ", ")
+              }
+          }
+
+          final class ExamScanner {
+              static let shared = ExamScanner()
+              private init() {}
+
+              func scan(root: URL) -> [ExamRecord] {
+                  let fm = FileManager.default
+                  guard let en = fm.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { return [] }
+                  var iniFiles: [URL] = []
+                  for case let url as URL in en where url.pathExtension.lowercased() == "ini" {
+                      if let text = readText(url), text.lowercased().contains("[examdata]") { iniFiles.append(url) }
+                  }
+                  return iniFiles.compactMap(parse).sorted {
+                      if $0.examDate == $1.examDate { return $0.patientName < $1.patientName }
+                      return $0.examDate > $1.examDate
+                  }
+              }
+
+              private func readText(_ url: URL) -> String? {
+                  if let s = try? String(contentsOf: url, encoding: .utf8) { return s }
+                  if let s = try? String(contentsOf: url, encoding: .isoLatin1) { return s }
+                  return try? String(contentsOf: url, encoding: .windowsCP1252)
+              }
+
+              private func parse(_ iniURL: URL) -> ExamRecord? {
+                  guard let text = readText(iniURL) else { return nil }
+                  var d: [String:String] = [:]
+                  for raw in text.components(separatedBy: .newlines) {
+                      let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                      guard !line.isEmpty, !line.hasPrefix("["), let eq = line.firstIndex(of: "=") else { continue }
+                      d[String(line[..<eq]).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()] = String(line[line.index(after:eq)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                  }
+                  let folder = iniURL.deletingLastPathComponent()
+                  let media = discoverMedia(in: folder)
+                  return ExamRecord(
+                      folderURL: folder,
+                      patientID: d["patid"] ?? d["patientid"] ?? "",
+                      firstName: d["patfirstname"] ?? d["firstname"] ?? "",
+                      lastName: d["patlastname"] ?? d["lastname"] ?? "",
+                      examDate: d["examdate"] ?? "",
+                      birthDate: d["birthdate"] ?? "",
+                      sex: d["sex"] ?? "",
+                      numImages: Int(d["numimages"] ?? "") ?? media.count,
+                      media: media
+                  )
+              }
+
+              private func discoverMedia(in folder: URL) -> [URL] {
+                  let fm = FileManager.default
+                  let allowed = Set(["wmv","asf","avi","mp4","mov","m4v","mpeg","mpg"])
+                  let children = (try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
+                  return children.filter { allowed.contains($0.pathExtension.lowercased()) }.sorted { mediaIndex($0) < mediaIndex($1) }
+              }
+
+              private func mediaIndex(_ url: URL) -> Int {
+                  let s = url.deletingPathExtension().lastPathComponent
+                  let match = s.range(of: #"\d+"#, options: .regularExpression)
+                  return match.flatMap { Int(s[$0]) } ?? Int.max
+              }
+          }
+
+          actor FFmpegService {
+              static let shared = FFmpegService()
+              enum Failure: LocalizedError {
+                  case missing
+                  case failed(String)
+                  var errorDescription: String? {
+                      switch self {
+                      case .missing: return "Mesin FFmpeg tidak ditemukan di dalam EchoVue."
+                      case .failed(let s): return "Gagal menyiapkan WMV: \(s)"
+                      }
+                  }
+              }
+              private let fm = FileManager.default
+              private var cache: URL {
+                  let root = fm.urls(for: .cachesDirectory, in: .userDomainMask).first!
+                  let u = root.appendingPathComponent("EchoVue", isDirectory: true)
+                  try? fm.createDirectory(at: u, withIntermediateDirectories: true)
+                  return u
+              }
+              private func ffmpeg() -> URL? {
+                  let bundled = Bundle.main.resourceURL?.appendingPathComponent("Tools/ffmpeg")
+                  if let bundled, fm.isExecutableFile(atPath: bundled.path) { return bundled }
+                  for p in ["/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg"] where fm.isExecutableFile(atPath: p) { return URL(fileURLWithPath:p) }
+                  return nil
+              }
+              func playable(_ source: URL) throws -> URL {
+                  if ["mp4","mov","m4v"].contains(source.pathExtension.lowercased()) { return source }
+                  guard let tool = ffmpeg() else { throw Failure.missing }
+                  let values = try? source.resourceValues(forKeys: [.contentModificationDateKey,.fileSizeKey])
+                  let token = source.path + "|\(values?.contentModificationDate?.timeIntervalSince1970 ?? 0)|\(values?.fileSize ?? 0)"
+                  let hash = SHA256.hash(data: Data(token.utf8)).map { String(format:"%02x",$0) }.joined()
+                  let out = cache.appendingPathComponent(String(hash.prefix(24)) + ".mp4")
+                  if fm.fileExists(atPath: out.path) { return out }
+                  let tmp = cache.appendingPathComponent(String(hash.prefix(24)) + ".tmp.mp4")
+                  try? fm.removeItem(at: tmp)
+
+                  do {
+                      try run(tool, ["-y","-hide_banner","-loglevel","error","-i",source.path,"-map","0:v:0","-an","-c:v","h264_videotoolbox","-b:v","8M","-pix_fmt","yuv420p","-movflags","+faststart",tmp.path])
+                  } catch {
+                      try? fm.removeItem(at: tmp)
+                      try run(tool, ["-y","-hide_banner","-loglevel","error","-i",source.path,"-map","0:v:0","-an","-c:v","libx264","-preset","veryfast","-crf","15","-pix_fmt","yuv420p","-movflags","+faststart",tmp.path])
+                  }
+                  try? fm.removeItem(at: out)
+                  try fm.moveItem(at: tmp, to: out)
+                  return out
+              }
+              func thumbnail(_ source: URL) throws -> URL {
+                  let stem = source.deletingPathExtension().lastPathComponent
+                  let folder = source.deletingLastPathComponent()
+                  let nearby = ["\(stem)_small.jpg","\(stem)_small.jpeg","\(stem)_small.png"]
+                  for name in nearby {
+                      let u = folder.appendingPathComponent(name)
+                      if fm.fileExists(atPath: u.path) { return u }
+                  }
+                  guard let tool = ffmpeg() else { throw Failure.missing }
+                  let hash = SHA256.hash(data: Data(source.path.utf8)).map { String(format:"%02x",$0) }.joined()
+                  let out = cache.appendingPathComponent("thumb_" + String(hash.prefix(20)) + ".jpg")
+                  if fm.fileExists(atPath: out.path) { return out }
+                  try run(tool,["-y","-hide_banner","-loglevel","error","-ss","0.25","-i",source.path,"-frames:v","1","-vf","scale=260:-2:flags=lanczos","-q:v","2",out.path])
+                  return out
+              }
+              private func run(_ exe: URL, _ args: [String]) throws {
+                  let p = Process(); p.executableURL = exe; p.arguments = args
+                  let err = Pipe(); p.standardError = err; p.standardOutput = Pipe()
+                  try p.run(); p.waitUntilExit()
+                  if p.terminationStatus != 0 {
+                      let s = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding:.utf8) ?? "exit \(p.terminationStatus)"
+                      throw Failure.failed(s.trimmingCharacters(in:.whitespacesAndNewlines))
+                  }
+              }
+          }
+
+          @MainActor
+          final class LibraryModel: ObservableObject {
+              @Published var exams:[ExamRecord]=[]
+              @Published var search=""
+              @Published var busy=false
+              @Published var error:String?
+              var filtered:[ExamRecord] {
+                  let q=search.trimmingCharacters(in:.whitespacesAndNewlines).lowercased()
+                  if q.isEmpty { return exams }
+                  return exams.filter { ("\($0.patientID) \($0.patientName) \($0.examDate) \($0.birthDate)").lowercased().contains(q) }
+              }
+              func choose() {
+                  let p=NSOpenPanel(); p.canChooseDirectories=true; p.canChooseFiles=false; p.allowsMultipleSelection=false; p.prompt="Buka"
+                  p.message="Pilih folder arsip MPEGVue yang berisi Exam.ini"
+                  guard p.runModal() == .OK, let u=p.url else { return }
+                  busy=true; error=nil
+                  Task.detached(priority:.userInitiated) {
+                      let result=ExamScanner.shared.scan(root:u)
+                      await MainActor.run { self.exams=result; self.busy=false }
+                  }
+              }
+          }
+
+          @MainActor
+          final class PlayerModel: ObservableObject {
+              @Published var player=AVPlayer()
+              @Published var preparing=false
+              @Published var playing=false
+              @Published var time:Double=0
+              @Published var duration:Double=0
+              @Published var error:String?
+              private var observer:Any?
+              private var endObs:NSObjectProtocol?
+              init() {
+                  observer=player.addPeriodicTimeObserver(forInterval:CMTime(seconds:0.05,preferredTimescale:600),queue:.main){[weak self] t in self?.time=t.seconds.isFinite ? t.seconds : 0}
+              }
+              deinit { if let observer { player.removeTimeObserver(observer) }; if let endObs { NotificationCenter.default.removeObserver(endObs) } }
+              func load(_ source:URL) {
+                  preparing=true; error=nil
+                  Task {
+                      do {
+                          let u = try await FFmpegService.shared.playable(source)
+                          let asset=AVURLAsset(url:u)
+                          let d=try await asset.load(.duration)
+                          let item=AVPlayerItem(asset:asset)
+                          player.replaceCurrentItem(with:item); duration=d.seconds.isFinite ? d.seconds:0; time=0; preparing=false
+                          if let endObs { NotificationCenter.default.removeObserver(endObs) }
+                          endObs=NotificationCenter.default.addObserver(forName:.AVPlayerItemDidPlayToEndTime,object:item,queue:.main){[weak self] _ in self?.player.seek(to:.zero); self?.player.play() }
+                          player.play(); playing=true
+                      } catch { preparing=false; self.error=error.localizedDescription }
+                  }
+              }
+              func toggle(){ if playing { player.pause() } else { player.play() }; playing.toggle() }
+              func seek(_ s:Double){ player.seek(to:CMTime(seconds:max(0,min(s,duration)),preferredTimescale:600),toleranceBefore:.zero,toleranceAfter:.zero) }
+          }
+
+          struct AVSurface:NSViewRepresentable {
+              let player:AVPlayer
+              func makeNSView(context:Context)->AVPlayerView { let v=AVPlayerView(); v.player=player; v.controlsStyle = .none; v.videoGravity = .resizeAspect; return v }
+              func updateNSView(_ v:AVPlayerView,context:Context){ v.player=player }
+          }
+
+          struct ExamListView:View {
+              @ObservedObject var model:LibraryModel
+              let open:(ExamRecord)->Void
+              var body:some View {
+                  VStack(spacing:0){
+                      HStack{ Button{model.choose()}{Label("Buka Folder MPEGVue",systemImage:"folder")}; Spacer(); TextField("Cari pasien / ID / tanggal",text:$model.search).textFieldStyle(.roundedBorder).frame(width:300); if model.busy{ProgressView()} }.padding(12).background(.bar)
+                      Divider()
+                      if model.filtered.isEmpty {
+                          VStack(spacing:16){ Image(systemName:"waveform.path.ecg.rectangle").font(.system(size:54)).foregroundStyle(.secondary); Text("Belum ada pemeriksaan").font(.title2.bold()); Text("Pilih folder MPEGVue. EchoVue akan membaca Exam.ini dan file WMV secara lokal.").foregroundStyle(.secondary); Button("Buka Folder"){model.choose()}.buttonStyle(.borderedProminent) }.frame(maxWidth:.infinity,maxHeight:.infinity)
+                      } else {
+                          Table(model.filtered){
+                              TableColumn("ID"){Text($0.patientID).monospacedDigit()}.width(min:100,ideal:120)
+                              TableColumn("Patient Name"){Text($0.patientName).fontWeight(.medium)}.width(min:240,ideal:350)
+                              TableColumn("Exam Date"){e in Button(e.examDate.isEmpty ? "Buka":e.examDate){open(e)}.buttonStyle(.link)}.width(min:110,ideal:130)
+                              TableColumn("Birth Date"){Text($0.birthDate)}.width(min:110,ideal:130)
+                              TableColumn("Images"){Text("\($0.media.count)").monospacedDigit()}.width(70)
+                          }
+                      }
+                  }
+              }
+          }
+
+          struct ExamView:View {
+              let exam:ExamRecord
+              let close:()->Void
+              @StateObject private var pm=PlayerModel()
+              @State private var selected=0
+              @State private var thumbs:[URL:URL]=[:]
+              var body:some View {
+                  VStack(spacing:0){
+                      HStack{Button(action:close){Label("Daftar pemeriksaan",systemImage:"chevron.left")}; Spacer(); Text(exam.patientName.isEmpty ? "EchoVue":exam.patientName).font(.headline); Spacer(); Button{NSApp.keyWindow?.toggleFullScreen(nil)}label:{Image(systemName:"arrow.up.left.and.arrow.down.right")}.help("Fullscreen")}.padding(10).background(.bar)
+                      HSplitView{
+                          ScrollView{LazyVGrid(columns:[GridItem(.flexible()),GridItem(.flexible())],spacing:8){ForEach(Array(exam.media.enumerated()),id:\.offset){i,u in Button{selected=i;pm.load(u)}label:{ZStack(alignment:.topLeading){RoundedRectangle(cornerRadius:5).fill(.black).aspectRatio(4/3,contentMode:.fit); if let t=thumbs[u],let img=NSImage(contentsOf:t){Image(nsImage:img).resizable().scaledToFit().clipShape(RoundedRectangle(cornerRadius:5))}else{ProgressView().frame(maxWidth:.infinity,maxHeight:.infinity)}; Text("\(i+1)").font(.headline.monospacedDigit()).foregroundStyle(.yellow).padding(4)}.overlay{RoundedRectangle(cornerRadius:5).stroke(i==selected ? Color.accentColor:.gray.opacity(0.4),lineWidth:i==selected ? 3:1)}}.buttonStyle(.plain)}}.padding(8)}.frame(minWidth:220,idealWidth:250,maxWidth:300).background(Color(nsColor:.underPageBackgroundColor))
+                          VStack(spacing:0){
+                              HStack{VStack(alignment:.leading){Text(exam.patientName).font(.title3.bold()); Text("ID \(exam.patientID)   •   Exam \(exam.examDate)   •   DOB \(exam.birthDate)").font(.caption).foregroundStyle(.secondary)};Spacer();Text("\(exam.media.count) cine").foregroundStyle(.secondary)}.padding(12)
+                              ZStack{Color.black;AVSurface(player:pm.player);if pm.preparing{VStack{ProgressView().controlSize(.large);Text("Menyiapkan WMV…")}.padding(18).background(.ultraThinMaterial,in:RoundedRectangle(cornerRadius:12))}}.frame(maxWidth:.infinity,maxHeight:.infinity).padding(8).background(.black)
+                              VStack(spacing:8){HStack{Text(clock(pm.time)).font(.caption.monospacedDigit()).frame(width:55);Slider(value:Binding(get:{pm.time},set:{pm.seek($0)}),in:0...max(pm.duration,0.01));Text(clock(pm.duration)).font(.caption.monospacedDigit()).frame(width:55)};HStack(spacing:14){Button{previous()}{Image(systemName:"chevron.left")};Button{pm.toggle()}{Image(systemName:pm.playing ? "pause.fill":"play.fill")}.keyboardShortcut(.space,modifiers:[]);Button{next()}{Image(systemName:"chevron.right")};Spacer();Text("WMV diproses lokal • tidak di-upload").font(.caption).foregroundStyle(.secondary)}}.padding(12).background(Color(nsColor:.controlBackgroundColor))
+                          }.frame(minWidth:760)
+                      }
+                  }
+                  .onAppear{loadThumbs();if let first=exam.media.first{pm.load(first)}}
+                  .alert("EchoVue",isPresented:Binding(get:{pm.error != nil},set:{if !$0{pm.error=nil}})){Button("OK",role:.cancel){pm.error=nil}}message:{Text(pm.error ?? "")}
+              }
+              private func loadThumbs(){for u in exam.media{Task{if let t=try? await FFmpegService.shared.thumbnail(u){await MainActor.run{thumbs[u]=t}}}}}
+              private func previous(){guard !exam.media.isEmpty else{return};selected=max(0,selected-1);pm.load(exam.media[selected])}
+              private func next(){guard !exam.media.isEmpty else{return};selected=min(exam.media.count-1,selected+1);pm.load(exam.media[selected])}
+              private func clock(_ s:Double)->String{guard s.isFinite else{return "00:00"};let x=max(0,Int(s));return String(format:"%02d:%02d",x/60,x%60)}
+          }
+
+          @main
+          struct EchoVueApp:App {
+              @StateObject private var model=LibraryModel()
+              @State private var exam:ExamRecord?
+              var body:some Scene {
+                  WindowGroup("EchoVue") { Group { if let e=exam { ExamView(exam:e){exam=nil} } else { ExamListView(model:model){exam=$0} } }.frame(minWidth:1050,minHeight:720) }
+                      .windowResizability(.contentMinSize)
+              }
+          }
+          SWIFT
+
+      - name: Build SwiftUI app
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd native-src
+          xcodebuild -version
+          swift --version
+          swift build -c release --arch arm64
+
+      - name: Assemble EchoVue.app
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE/native-src"
+          DIST="$GITHUB_WORKSPACE/dist"
+          APP="$DIST/EchoVue.app"
+          CONTENTS="$APP/Contents"
+          MACOS="$CONTENTS/MacOS"
+          RESOURCES="$CONTENTS/Resources"
+          TOOLS="$RESOURCES/Tools"
+          mkdir -p "$MACOS" "$TOOLS"
+          BIN=""
+          for C in "$ROOT/.build/arm64-apple-macosx/release/EchoVueMac" "$ROOT/.build/release/EchoVueMac"; do if [ -x "$C" ]; then BIN="$C"; break; fi; done
+          test -n "$BIN"
+          cp "$BIN" "$MACOS/EchoVue"
+          chmod +x "$MACOS/EchoVue"
+          cat > "$CONTENTS/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+          <key>CFBundleDisplayName</key><string>EchoVue</string>
+          <key>CFBundleExecutable</key><string>EchoVue</string>
+          <key>CFBundleIdentifier</key><string>com.bennyantama.echovue</string>
+          <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+          <key>CFBundleName</key><string>EchoVue</string>
+          <key>CFBundlePackageType</key><string>APPL</string>
+          <key>CFBundleShortVersionString</key><string>0.3.0</string>
+          <key>CFBundleVersion</key><string>3</string>
+          <key>LSMinimumSystemVersion</key><string>13.0</string>
+          <key>NSHighResolutionCapable</key><true/>
+          </dict></plist>
+          PLIST
+
+          curl -fL --retry 3 --retry-delay 2 -o "$TOOLS/ffmpeg" \
+            "https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffmpeg-darwin-arm64"
+          echo "a90e3db6a3fd35f6074b013f948b1aa45b31c6375489d39e572bea3f18336584  $TOOLS/ffmpeg" | shasum -a 256 -c -
+          chmod +x "$TOOLS/ffmpeg"
+          curl -fL --retry 3 -o "$RESOURCES/FFMPEG_LICENSE.txt" \
+            "https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/darwin-arm64.LICENSE"
+
+          /usr/bin/codesign --force --deep --sign - "$APP"
+          /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP"
+
+      - name: Create DMG and ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIST="$GITHUB_WORKSPACE/dist"
+          APP="$DIST/EchoVue.app"
+          ZIP="$DIST/EchoVue-macOS-AppleSilicon-v0.3.0.zip"
+          DMG="$DIST/EchoVue-macOS-AppleSilicon-v0.3.0.dmg"
+          /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+          STAGE="$RUNNER_TEMP/echovue-dmg"
+          rm -rf "$STAGE"; mkdir -p "$STAGE"
+          cp -R "$APP" "$STAGE/EchoVue.app"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create -volname "EchoVue" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
+          shasum -a 256 "$ZIP" "$DMG" | tee "$DIST/SHA256SUMS.txt"
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: EchoVue-macOS-AppleSilicon-v0.3.0
+          path: |
+            dist/EchoVue-macOS-AppleSilicon-v0.3.0.dmg
+            dist/EchoVue-macOS-AppleSilicon-v0.3.0.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
