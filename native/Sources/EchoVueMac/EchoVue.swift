@@ -46,7 +46,13 @@ final class ExamScanner {
             }
         }
 
-        return iniFiles.compactMap(parse).sorted {
+        let examFolders = iniFiles.map {
+            $0.deletingLastPathComponent().standardizedFileURL
+        }
+
+        return iniFiles.compactMap { iniURL in
+            parse(iniURL, examFolders: examFolders)
+        }.sorted {
             if $0.examDate == $1.examDate {
                 return $0.patientName.localizedCaseInsensitiveCompare($1.patientName) == .orderedAscending
             }
@@ -60,7 +66,7 @@ final class ExamScanner {
         return try? String(contentsOf: url, encoding: .windowsCP1252)
     }
 
-    private func parse(_ iniURL: URL) -> ExamRecord? {
+    private func parse(_ iniURL: URL, examFolders: [URL]) -> ExamRecord? {
         guard let text = readText(iniURL) else { return nil }
         var values: [String: String] = [:]
 
@@ -79,7 +85,7 @@ final class ExamScanner {
         }
 
         let folder = iniURL.deletingLastPathComponent()
-        let media = discoverMedia(in: folder)
+        let media = discoverMedia(in: folder, examFolders: examFolders)
 
         return ExamRecord(
             folderURL: folder,
@@ -94,22 +100,42 @@ final class ExamScanner {
         )
     }
 
-    private func discoverMedia(in folder: URL) -> [URL] {
+    private func discoverMedia(in folder: URL, examFolders: [URL]) -> [URL] {
         let fm = FileManager.default
         let allowed = Set(["wmv", "asf", "avi", "mp4", "mov", "m4v", "mpeg", "mpg"])
-        let children = (try? fm.contentsOfDirectory(
+        let currentFolder = folder.standardizedFileURL.path
+        let examFolderPaths = examFolders.map { $0.standardizedFileURL.path }
+
+        guard let enumerator = fm.enumerator(
             at: folder,
             includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        )) ?? []
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        ) else { return [] }
 
-        return children
-            .filter { allowed.contains($0.pathExtension.lowercased()) }
-            .sorted {
-                let a = mediaIndex($0)
-                let b = mediaIndex($1)
-                return a == b ? $0.lastPathComponent < $1.lastPathComponent : a < b
+        var media: [URL] = []
+
+        for case let url as URL in enumerator {
+            guard allowed.contains(url.pathExtension.lowercased()) else { continue }
+
+            let filePath = url.standardizedFileURL.path
+
+            // MPEGVue archives are sometimes nested. Assign each video to the
+            // nearest ancestor directory that contains an Exam.ini so one exam
+            // cannot steal cine files belonging to a nested exam.
+            let owner = examFolderPaths
+                .filter { filePath == $0 || filePath.hasPrefix($0 + "/") }
+                .max(by: { $0.count < $1.count })
+
+            if owner == currentFolder {
+                media.append(url)
             }
+        }
+
+        return media.sorted {
+            let a = mediaIndex($0)
+            let b = mediaIndex($1)
+            return a == b ? $0.lastPathComponent < $1.lastPathComponent : a < b
+        }
     }
 
     private func mediaIndex(_ url: URL) -> Int {
