@@ -74,8 +74,8 @@ jobs:
             <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
             <key>CFBundleName</key><string>EchoVue</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>0.3.1</string>
-            <key>CFBundleVersion</key><string>4</string>
+            <key>CFBundleShortVersionString</key><string>0.3.2</string>
+            <key>CFBundleVersion</key><string>5</string>
             <key>LSMinimumSystemVersion</key><string>13.0</string>
             <key>NSHighResolutionCapable</key><true/>
           </dict>
@@ -102,8 +102,8 @@ jobs:
 
           DIST="$GITHUB_WORKSPACE/dist"
           APP="$DIST/EchoVue.app"
-          ZIP="$DIST/EchoVue-macOS-AppleSilicon-v0.3.1.zip"
-          DMG="$DIST/EchoVue-macOS-AppleSilicon-v0.3.1.dmg"
+          ZIP="$DIST/EchoVue-macOS-AppleSilicon-v0.3.2.zip"
+          DMG="$DIST/EchoVue-macOS-AppleSilicon-v0.3.2.dmg"
 
           /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
 
@@ -122,10 +122,10 @@ jobs:
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
-          name: EchoVue-macOS-AppleSilicon-v0.3.1
+          name: EchoVue-macOS-AppleSilicon-v0.3.2
           path: |
-            dist/EchoVue-macOS-AppleSilicon-v0.3.1.dmg
-            dist/EchoVue-macOS-AppleSilicon-v0.3.1.zip
+            dist/EchoVue-macOS-AppleSilicon-v0.3.2.dmg
+            dist/EchoVue-macOS-AppleSilicon-v0.3.2.zip
             dist/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
